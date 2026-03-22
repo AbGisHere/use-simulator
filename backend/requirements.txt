@@ -90,3 +90,4 @@ websockets==16.0
 xgboost==3.2.0
 optuna==4.3.0
 yfinance==1.2.0
+psycopg2-binary>=2.9.9   # PostgreSQL driver for cloud DB support

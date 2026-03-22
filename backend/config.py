@@ -10,9 +10,19 @@ load_dotenv(Path(__file__).parent / ".env")
 # Timezone constant used across the entire app
 IST = ZoneInfo("Asia/Kolkata")
 
-# Database
-DB_PATH = Path(__file__).parent / "data" / "nse_simulator.db"
-DB_URL = f"sqlite:///{DB_PATH}"
+# Database — local SQLite by default, cloud PostgreSQL if DATABASE_URL is set.
+# To use a cloud database (e.g. Supabase), set DATABASE_URL in .env:
+#   DATABASE_URL=postgresql://postgres:password@db.xxxx.supabase.co:5432/postgres
+_DATABASE_URL_ENV = os.getenv("DATABASE_URL", "").strip()
+if _DATABASE_URL_ENV:
+    # Cloud PostgreSQL (Supabase, Neon, Railway, etc.)
+    # Supabase connection strings start with "postgres://" — SQLAlchemy needs "postgresql://"
+    DB_URL = _DATABASE_URL_ENV.replace("postgres://", "postgresql://", 1)
+    DB_PATH = None   # not used for PostgreSQL
+else:
+    # Local SQLite fallback
+    DB_PATH = Path(__file__).parent / "data" / "nse_simulator.db"
+    DB_URL = f"sqlite:///{DB_PATH}"
 
 # API Keys
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
