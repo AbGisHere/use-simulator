@@ -1,5 +1,5 @@
-# NSE Simulator Launcher — Windows PowerShell
-# Usage: Right-click → "Run with PowerShell"  OR  run from terminal:
+# NSE Simulator Launcher - Windows PowerShell
+# Usage: Right-click -> "Run with PowerShell"  OR  run from terminal:
 #   powershell -ExecutionPolicy Bypass -File start.ps1
 #
 # Requirements: Python 3.11+, Node.js 18+
@@ -11,12 +11,12 @@ $BackendDir  = Join-Path $ProjectRoot "backend"
 $FrontendDir = Join-Path $ProjectRoot "frontend"
 
 Write-Host ""
-Write-Host "╔══════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║        NSE Simulator Launcher        ║" -ForegroundColor Green
-Write-Host "╚══════════════════════════════════════╝" -ForegroundColor Green
+Write-Host "+======================================+" -ForegroundColor Green
+Write-Host "|        NSE Simulator Launcher        |" -ForegroundColor Green
+Write-Host "+======================================+" -ForegroundColor Green
 Write-Host ""
 
-# ── Check prerequisites ───────────────────────────────────────────────────────
+# -- Check prerequisites -------------------------------------------------------
 
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     Write-Host "ERROR: Python not found. Install Python 3.11+ from python.org" -ForegroundColor Red
@@ -27,7 +27,7 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# ── Backend setup ─────────────────────────────────────────────────────────────
+# -- Backend setup -------------------------------------------------------------
 
 Write-Host "Setting up backend..." -ForegroundColor Yellow
 Set-Location $BackendDir
@@ -35,13 +35,17 @@ Set-Location $BackendDir
 # Create .env if missing
 if (-not (Test-Path ".env") -and (Test-Path ".env.example")) {
     Copy-Item ".env.example" ".env"
-    Write-Host "Created backend\.env from .env.example — edit it to add API keys." -ForegroundColor Yellow
+    Write-Host "Created backend\.env from .env.example - edit it to add API keys." -ForegroundColor Yellow
 }
 
 # Create venv if missing
 if (-not (Test-Path ".venv")) {
     Write-Host "Creating Python virtual environment..."
-    python -m venv .venv
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        py -3.12 -m venv .venv
+    } else {
+        python -m venv .venv
+    }
 }
 
 # Install/upgrade dependencies
@@ -51,19 +55,19 @@ Write-Host "Installing Python dependencies..."
 
 Write-Host "Backend ready." -ForegroundColor Green
 
-# ── Frontend setup ─────────────────────────────────────────────────────────────
+# -- Frontend setup -------------------------------------------------------------
 
 Write-Host "Setting up frontend..." -ForegroundColor Yellow
 Set-Location $FrontendDir
 
-if (-not (Test-Path "node_modules")) {
+if (-not (Test-Path "node_modules\.bin\next")) {
     Write-Host "Installing Node.js dependencies..."
     npm install --legacy-peer-deps
 }
 
 Write-Host "Frontend ready." -ForegroundColor Green
 
-# ── Launch both services ──────────────────────────────────────────────────────
+# -- Launch both services ------------------------------------------------------
 
 Write-Host ""
 Write-Host "Starting services..." -ForegroundColor Green
@@ -75,22 +79,20 @@ Write-Host "Note: First stock addition downloads the FinBERT model (~500MB)." -F
 Write-Host "Press Ctrl+C to stop both services."
 Write-Host ""
 
-# Start backend in a new window
-$backendCmd = "& '$BackendDir\.venv\Scripts\python.exe' -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
-$backendProc = Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$BackendDir'; $backendCmd" -PassThru
+# Start backend in this window
+$backendProc = Start-Process "$BackendDir\.venv\Scripts\python.exe" -ArgumentList "-m uvicorn main:app --host 0.0.0.0 --port 8000 --reload" -WorkingDirectory $BackendDir -NoNewWindow -PassThru
 
 # Brief pause for backend to start
 Start-Sleep -Seconds 3
 
-# Start frontend
-Set-Location $FrontendDir
-$frontendProc = Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$FrontendDir'; npm run dev" -PassThru
+# Start frontend in this window
+$frontendProc = Start-Process "cmd.exe" -ArgumentList "/c npm run dev" -WorkingDirectory $FrontendDir -NoNewWindow -PassThru
 
-Write-Host "Both services started in separate windows." -ForegroundColor Green
-Write-Host "Close this window or press any key to stop both services..."
+Write-Host "Both services are running in this window." -ForegroundColor Green
+Write-Host "Press any key to stop both services..."
 $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 
 # Cleanup
 Write-Host "Shutting down..."
-Stop-Process -Id $backendProc.Id  -ErrorAction SilentlyContinue
-Stop-Process -Id $frontendProc.Id -ErrorAction SilentlyContinue
+Stop-Process -Id $backendProc.Id -Force -ErrorAction SilentlyContinue
+Stop-Process -Id $frontendProc.Id -Force -ErrorAction SilentlyContinue
