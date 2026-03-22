@@ -174,15 +174,15 @@ def predict_tomorrow(
     predicted_price_high = round(predicted_price + band_width, 2)
 
     return {
-        "predicted_price":      round(predicted_price, 2),
-        "predicted_price_low":  predicted_price_low,
-        "predicted_price_high": predicted_price_high,
-        "direction":            direction,
-        "confidence":           round(confidence, 4),
-        "xgb_up_prob":          round(xgb_up_prob, 4),
-        "lstm_up_prob":         round(lstm_up_prob, 4) if lstm_up_prob is not None else None,
-        "predicted_return_pct": round(predicted_return_pct, 3),
-        "model":                model_label,
+        "predicted_price":      float(round(predicted_price, 2)),
+        "predicted_price_low":  float(predicted_price_low),
+        "predicted_price_high": float(predicted_price_high),
+        "direction":            int(direction),
+        "confidence":           float(round(confidence, 4)),
+        "xgb_up_prob":          float(round(xgb_up_prob, 4)),
+        "lstm_up_prob":         float(round(lstm_up_prob, 4)) if lstm_up_prob is not None else None,
+        "predicted_return_pct": float(round(predicted_return_pct, 3)),
+        "model":                str(model_label),
     }
 
 

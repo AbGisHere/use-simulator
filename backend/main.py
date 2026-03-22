@@ -241,11 +241,12 @@ def _run_full_pipeline(ticker: str, _unused_db: Session = None) -> None:
                         projected_price=float(row["projected_price"]),
                         prediction_type="future",
                         # Tomorrow-specific precise fields
-                        predicted_price=      tomorrow.get("predicted_price")      if is_tomorrow else None,
-                        predicted_price_low=  tomorrow.get("predicted_price_low")  if is_tomorrow else None,
-                        predicted_price_high= tomorrow.get("predicted_price_high") if is_tomorrow else None,
-                        predicted_return_pct= tomorrow.get("predicted_return_pct") if is_tomorrow else None,
-                        lstm_up_prob=         tomorrow.get("lstm_up_prob")         if is_tomorrow else None,
+                        # Tomorrow-specific precise fields
+                        predicted_price=      (float(tomorrow["predicted_price"])      if tomorrow.get("predicted_price")      is not None else None) if is_tomorrow else None,
+                        predicted_price_low=  (float(tomorrow["predicted_price_low"])  if tomorrow.get("predicted_price_low")  is not None else None) if is_tomorrow else None,
+                        predicted_price_high= (float(tomorrow["predicted_price_high"]) if tomorrow.get("predicted_price_high") is not None else None) if is_tomorrow else None,
+                        predicted_return_pct= (float(tomorrow["predicted_return_pct"]) if tomorrow.get("predicted_return_pct") is not None else None) if is_tomorrow else None,
+                        lstm_up_prob=         (float(tomorrow["lstm_up_prob"])         if tomorrow.get("lstm_up_prob")         is not None else None) if is_tomorrow else None,
                     )
                 )
             logger.info("Stored %d future predictions for %s", len(future_df), symbol)
