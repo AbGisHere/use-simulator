@@ -209,3 +209,53 @@ export async function updateHolding(
 export async function removeHolding(ticker: string): Promise<void> {
   await api.delete(`/api/portfolio/${ticker}`);
 }
+
+// ── Intraday (10-min) ─────────────────────────────────────────────────────────
+
+export interface IntradayBar {
+  timestamp: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface IntradayPrediction {
+  direction: number;           // 1 = up, 0 = down
+  confidence: number;
+  up_probability: number;
+  predicted_price: number;
+  predicted_return: number;
+  upper_band: number;
+  lower_band: number;
+  last_price: number;
+  next_time: string;           // "HH:MM"
+}
+
+export interface SessionPrediction {
+  time: string;
+  predicted_dir: number | null;
+  predicted_price: number | null;
+  actual_price: number | null;
+  correct: boolean | null;
+}
+
+export interface SessionAccuracy {
+  total: number;
+  correct: number;
+  accuracy: number | null;
+  predictions: SessionPrediction[];
+}
+
+export interface IntradayData {
+  ticker: string;
+  bars: IntradayBar[];
+  prediction: IntradayPrediction | null;
+  session_accuracy: SessionAccuracy;
+}
+
+export async function fetchIntradayData(ticker: string): Promise<IntradayData> {
+  const res = await api.get<IntradayData>(`/api/stocks/${ticker}/intraday`);
+  return res.data;
+}

@@ -34,9 +34,11 @@ logger = logging.getLogger(__name__)
 # Silence Optuna's own verbose logging — we log our own summary
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# Tuning budget per refresh — 30 trials ≈ 30-90 seconds depending on data size.
-# Raises to 50 after 3 refreshes to explore more once promising regions are found.
-N_TRIALS_BASE = 30
+# Tuning budget per refresh:
+#   First 60 trials — exploration (broad search)
+#   After 60 trials  — exploitation (TPE focuses on best regions, more trials)
+N_TRIALS_BASE  = 35    # per refresh before we have history
+N_TRIALS_EXPLOIT = 60  # per refresh once we have 60+ past trials
 FOLD_SIZE = 63      # ~1 quarter, same as train.py
 
 
@@ -124,20 +126,60 @@ def tune_hyperparameters(
 
     # More trials once we have a history to exploit
     if n_trials is None:
-        n_trials = 50 if past_trials >= 60 else N_TRIALS_BASE
+        n_trials = N_TRIALS_EXPLOIT if past_trials >= 60 else N_TRIALS_BASE
 
     # ── Define search space ───────────────────────────────────────────────────
+    # 16 hyperparameters covering tree structure, regularisation, sampling,
+    # and boosting schedule.  Wider ranges allow Optuna to discover unusual
+    # but effective configs that hand-tuning would miss.
     def objective(trial: optuna.Trial) -> float:
+        # ── Boosting schedule ──────────────────────────────────────────────
+        n_estimators  = trial.suggest_int("n_estimators", 80, 800)
+        learning_rate = trial.suggest_float("learning_rate", 0.005, 0.4, log=True)
+
+        # ── Tree structure ─────────────────────────────────────────────────
+        max_depth          = trial.suggest_int("max_depth", 2, 10)
+        min_child_weight   = trial.suggest_int("min_child_weight", 1, 50)
+        max_delta_step     = trial.suggest_int("max_delta_step", 0, 10)
+        gamma              = trial.suggest_float("gamma", 0.0, 5.0)
+
+        # ── Regularisation ─────────────────────────────────────────────────
+        reg_alpha  = trial.suggest_float("reg_alpha", 1e-5, 10.0, log=True)
+        reg_lambda = trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True)
+
+        # ── Feature & row sampling ─────────────────────────────────────────
+        subsample          = trial.suggest_float("subsample", 0.4, 1.0)
+        colsample_bytree   = trial.suggest_float("colsample_bytree", 0.3, 1.0)
+        colsample_bylevel  = trial.suggest_float("colsample_bylevel", 0.3, 1.0)
+        colsample_bynode   = trial.suggest_float("colsample_bynode", 0.3, 1.0)
+
+        # ── Tree growing policy ────────────────────────────────────────────
+        # "depthwise" is standard; "lossguide" is LightGBM-style leaf-wise
+        grow_policy = trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"])
+        # max_leaves only applies to lossguide
+        max_leaves  = trial.suggest_int("max_leaves", 0, 256) if grow_policy == "lossguide" else 0
+
+        # ── Class imbalance correction ─────────────────────────────────────
+        # Most NSE stocks have roughly equal up/down days, but this lets
+        # Optuna discover if slight weighting helps.
+        scale_pos_weight = trial.suggest_float("scale_pos_weight", 0.5, 2.0)
+
         params = {
-            "n_estimators": trial.suggest_int("n_estimators", 100, 600),
-            "max_depth": trial.suggest_int("max_depth", 3, 8),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
-            "min_child_weight": trial.suggest_int("min_child_weight", 1, 30),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 2.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
-            "gamma": trial.suggest_float("gamma", 0.0, 1.0),
+            "n_estimators":       n_estimators,
+            "learning_rate":      learning_rate,
+            "max_depth":          max_depth,
+            "min_child_weight":   min_child_weight,
+            "max_delta_step":     max_delta_step,
+            "gamma":              gamma,
+            "reg_alpha":          reg_alpha,
+            "reg_lambda":         reg_lambda,
+            "subsample":          subsample,
+            "colsample_bytree":   colsample_bytree,
+            "colsample_bylevel":  colsample_bylevel,
+            "colsample_bynode":   colsample_bynode,
+            "grow_policy":        grow_policy,
+            "max_leaves":         max_leaves,
+            "scale_pos_weight":   scale_pos_weight,
         }
         return _walk_forward_score(params, df, feature_cols)
 

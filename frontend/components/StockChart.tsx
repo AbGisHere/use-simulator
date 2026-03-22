@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import {
   ComposedChart,
   Line,
@@ -12,7 +12,14 @@ import {
   ReferenceLine,
 } from "recharts";
 import { subMonths, subYears, parseISO, isAfter } from "date-fns";
-import { ChartDataPoint, FutureDataPoint } from "../lib/api";
+import {
+  ChartDataPoint,
+  FutureDataPoint,
+  IntradayData,
+  IntradayBar,
+  SessionPrediction,
+  fetchIntradayData,
+} from "../lib/api";
 
 // ── Combined data structure for the chart ─────────────────────────────────────
 // Historical and future points are merged into one array so Recharts renders
@@ -41,12 +48,305 @@ interface StockChartProps {
   data: ChartDataPoint[];
   futureData: FutureDataPoint[];
   ticker: string;
-  buyPrice?: number;   // optional — shows a horizontal entry price line
-  buyQuantity?: number; // optional — used to show unrealised P&L in tooltip
+  buyPrice?: number;
+  buyQuantity?: number;
 }
 
-type DateRange = "1M" | "3M" | "6M" | "1Y" | "ALL";
-const DATE_RANGE_OPTIONS: DateRange[] = ["1M", "3M", "6M", "1Y", "ALL"];
+// ── Intraday point structure (for "Today" tab) ────────────────────────────────
+interface IntradayPoint {
+  time: string;
+  close: number;
+  open: number;
+  high: number;
+  low: number;
+  volume: number;
+  predictedPrice?: number;   // model's next-bar predicted price (last bar only)
+  upperBand?: number;
+  lowerBand?: number;
+  predDot?: number;          // for correct predictions (green)
+  wrongDot?: number;         // for incorrect predictions (red)
+}
+
+// ── Intraday tooltip ─────────────────────────────────────────────────────────
+function IntradayTooltip({ active, payload, label }: any) {
+  if (!active || !payload?.length) return null;
+  const pt: IntradayPoint = payload[0]?.payload ?? {};
+  const fmt = (v: number) =>
+    `₹${v.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return (
+    <div style={{
+      background: "#0f172a", border: "1px solid #334155", borderRadius: 8,
+      padding: "10px 14px", fontSize: 12, minWidth: 160,
+    }}>
+      <p style={{ color: "#64748b", marginBottom: 6 }}>{label}</p>
+      <p style={{ color: "#3b82f6" }}>Close: {fmt(pt.close)}</p>
+      {pt.open  != null && <p style={{ color: "#94a3b8" }}>O: {fmt(pt.open)} H: {fmt(pt.high)} L: {fmt(pt.low)}</p>}
+      {pt.predictedPrice != null && (
+        <p style={{ color: "#f97316" }}>Predicted: {fmt(pt.predictedPrice)}</p>
+      )}
+    </div>
+  );
+}
+
+// ── Today Intraday Chart ──────────────────────────────────────────────────────
+function TodayChart({ ticker }: { ticker: string }) {
+  const [data, setData] = useState<IntradayData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const d = await fetchIntradayData(ticker);
+      setData(d);
+      setError(null);
+    } catch (e: any) {
+      setError(e?.message ?? "Failed to load intraday data");
+    } finally {
+      setLoading(false);
+    }
+  }, [ticker]);
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 30_000);   // auto-refresh every 30 seconds
+    return () => clearInterval(id);
+  }, [load]);
+
+  // Build chart points from bars + session accuracy markers
+  const chartPoints = useMemo<IntradayPoint[]>(() => {
+    if (!data?.bars?.length) return [];
+
+    // Build a lookup from time → session prediction
+    const predByTime: Record<string, SessionPrediction> = {};
+    for (const p of data.session_accuracy?.predictions ?? []) {
+      if (p.time) predByTime[p.time.slice(0, 5)] = p;   // "HH:MM"
+    }
+
+    const pts: IntradayPoint[] = data.bars.map((b) => {
+      const ts      = new Date(b.timestamp);
+      const timeStr = ts.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: false });
+      const sp      = predByTime[timeStr];
+      return {
+        time:   timeStr,
+        close:  b.close,
+        open:   b.open,
+        high:   b.high,
+        low:    b.low,
+        volume: b.volume,
+        predDot:  sp?.correct === true  ? b.close : undefined,
+        wrongDot: sp?.correct === false ? b.close : undefined,
+      };
+    });
+
+    // Add predicted next-bar price as a dotted extension
+    if (data.prediction) {
+      const pred = data.prediction;
+      const last = pts[pts.length - 1];
+      if (last) {
+        last.predictedPrice = pred.predicted_price;
+        last.upperBand      = pred.upper_band;
+        last.lowerBand      = pred.lower_band;
+      }
+      pts.push({
+        time:           pred.next_time,
+        close:          pred.predicted_price,
+        open:           pred.predicted_price,
+        high:           pred.upper_band,
+        low:            pred.lower_band,
+        volume:         0,
+        predictedPrice: pred.predicted_price,
+        upperBand:      pred.upper_band,
+        lowerBand:      pred.lower_band,
+      });
+    }
+
+    return pts;
+  }, [data]);
+
+  // Price domain
+  const priceMin = useMemo(() => {
+    const vals = chartPoints.flatMap((p) => [p.low, p.lowerBand].filter((v): v is number => v != null));
+    return vals.length ? Math.min(...vals) * 0.998 : 0;
+  }, [chartPoints]);
+
+  const priceMax = useMemo(() => {
+    const vals = chartPoints.flatMap((p) => [p.high, p.upperBand, p.close].filter((v): v is number => v != null));
+    return vals.length ? Math.max(...vals) * 1.002 : 100;
+  }, [chartPoints]);
+
+  if (loading) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 420, color: "#64748b" }}>
+        Loading intraday data...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 420, color: "#ef4444" }}>
+        {error}
+      </div>
+    );
+  }
+
+  const pred         = data?.prediction;
+  const sessAcc      = data?.session_accuracy;
+  const accuracy     = sessAcc?.accuracy;
+  const totalChecks  = sessAcc?.total ?? 0;
+  const bars         = data?.bars ?? [];
+  const lastBar      = bars[bars.length - 1];
+  const lastPrice    = lastBar?.close;
+  const firstPrice   = bars[0]?.open;
+  const dayChange    = (lastPrice != null && firstPrice != null)
+    ? ((lastPrice - firstPrice) / firstPrice * 100) : null;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+
+      {/* Intraday stats bar */}
+      <div style={{
+        display: "flex", flexWrap: "wrap", gap: 20,
+        padding: "10px 14px", background: "#0f172a", borderRadius: 8,
+        fontSize: 12,
+      }}>
+        <div>
+          <span style={{ color: "#64748b" }}>Bars today: </span>
+          <span style={{ color: "#cbd5e1" }}>{bars.length}</span>
+        </div>
+        {lastPrice != null && (
+          <div>
+            <span style={{ color: "#64748b" }}>Last: </span>
+            <span style={{ color: "#3b82f6", fontWeight: 600 }}>
+              ₹{lastPrice.toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+            </span>
+          </div>
+        )}
+        {dayChange != null && (
+          <div>
+            <span style={{ color: "#64748b" }}>Day change: </span>
+            <span style={{ color: dayChange >= 0 ? "#22c55e" : "#ef4444", fontWeight: 600 }}>
+              {dayChange >= 0 ? "+" : ""}{dayChange.toFixed(2)}%
+            </span>
+          </div>
+        )}
+        {pred && (
+          <div>
+            <span style={{ color: "#64748b" }}>Next bar ({pred.next_time}): </span>
+            <span style={{ color: pred.direction === 1 ? "#22c55e" : "#ef4444", fontWeight: 600 }}>
+              {pred.direction === 1 ? "↑ UP" : "↓ DOWN"} ({(pred.confidence * 100).toFixed(0)}%)
+            </span>
+            <span style={{ color: "#64748b" }}>  →  </span>
+            <span style={{ color: "#f97316" }}>
+              ₹{pred.predicted_price.toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+            </span>
+          </div>
+        )}
+        {totalChecks > 0 && (
+          <div>
+            <span style={{ color: "#64748b" }}>Today's accuracy: </span>
+            <span style={{
+              color: (accuracy ?? 0) >= 0.54 ? "#22c55e" : (accuracy ?? 0) >= 0.50 ? "#eab308" : "#ef4444",
+              fontWeight: 600,
+            }}>
+              {accuracy != null ? `${(accuracy * 100).toFixed(0)}%` : "—"}
+            </span>
+            <span style={{ color: "#64748b" }}> ({totalChecks} checks)</span>
+          </div>
+        )}
+        <div style={{ marginLeft: "auto", color: "#475569", fontSize: 11 }}>
+          Auto-refreshes every 30s
+        </div>
+      </div>
+
+      {/* Chart */}
+      {chartPoints.length === 0 ? (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 380, color: "#64748b" }}>
+          No intraday bars available yet — market may not have opened, or auto_trainer is not running.
+        </div>
+      ) : (
+        <ResponsiveContainer width="100%" height={380}>
+          <ComposedChart data={chartPoints} margin={{ top: 10, right: 40, left: 10, bottom: 10 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+            <XAxis
+              dataKey="time"
+              tick={{ fontSize: 11, fill: "#64748b" }}
+              tickLine={false}
+              axisLine={{ stroke: "#334155" }}
+              minTickGap={40}
+            />
+            <YAxis
+              domain={[priceMin, priceMax]}
+              tick={{ fontSize: 11, fill: "#64748b" }}
+              tickLine={false}
+              axisLine={false}
+              tickFormatter={(v) => `₹${v >= 1000 ? (v / 1000).toFixed(1) + "k" : v.toFixed(0)}`}
+              width={55}
+            />
+            <Tooltip content={<IntradayTooltip />} />
+
+            {/* Confidence band for predicted bar */}
+            <Area type="monotone" dataKey="upperBand"
+              fill="#f97316" stroke="none" fillOpacity={0.08} connectNulls={false} />
+            <Area type="monotone" dataKey="lowerBand"
+              fill="#f97316" stroke="none" fillOpacity={0.08} connectNulls={false} />
+
+            {/* Main close price line */}
+            <Line
+              type="monotone" dataKey="close"
+              stroke="#3b82f6" strokeWidth={2}
+              dot={false} activeDot={{ r: 4 }} connectNulls={false}
+              name="Close"
+            />
+
+            {/* Predicted extension (orange dotted) */}
+            <Line
+              type="monotone" dataKey="predictedPrice"
+              stroke="#f97316" strokeWidth={2} strokeDasharray="5 4"
+              dot={{ r: 4, fill: "#f97316" }} connectNulls={false}
+              name="Predicted"
+            />
+
+            {/* Correct prediction dots (green) */}
+            {chartPoints.filter((p) => p.predDot != null).map((p, i) => (
+              <ReferenceDot key={`ok-${i}`} x={p.time} y={p.predDot!}
+                r={6} fill="#22c55e" stroke="#16a34a" strokeWidth={1.5} label="" />
+            ))}
+
+            {/* Wrong prediction dots (red) */}
+            {chartPoints.filter((p) => p.wrongDot != null).map((p, i) => (
+              <ReferenceDot key={`bad-${i}`} x={p.time} y={p.wrongDot!}
+                r={6} fill="#ef4444" stroke="#dc2626" strokeWidth={1.5} label="" />
+            ))}
+          </ComposedChart>
+        </ResponsiveContainer>
+      )}
+
+      {/* Legend */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 16, fontSize: 11, color: "#475569" }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ display: "inline-block", width: 20, height: 2, background: "#3b82f6" }} />
+          10-min close price
+        </span>
+        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ display: "inline-block", width: 20, height: 0, borderTop: "2px dashed #f97316" }} />
+          Next-bar prediction
+        </span>
+        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", background: "#22c55e" }} />
+          Correct prediction
+        </span>
+        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", background: "#ef4444" }} />
+          Wrong prediction
+        </span>
+      </div>
+    </div>
+  );
+}
+
+type DateRange = "TODAY" | "1M" | "3M" | "6M" | "1Y" | "ALL";
+const DATE_RANGE_OPTIONS: DateRange[] = ["TODAY", "1M", "3M", "6M", "1Y", "ALL"];
 
 // Convert a direction (1/0) + base price into a price-offset line value
 // so predicted direction shows up as a visible line on the price chart.
@@ -148,7 +448,7 @@ function ToggleItem({
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function StockChart({ data, futureData, ticker, buyPrice, buyQuantity }: StockChartProps) {
-  const [range, setRange] = useState<DateRange>("1Y");
+  const [range, setRange] = useState<DateRange>("TODAY");
   const [showActual, setShowActual] = useState(true);
   const [showUpdated, setShowUpdated] = useState(true);
   const [showInitial, setShowInitial] = useState(true);
@@ -224,10 +524,53 @@ export default function StockChart({ data, futureData, ticker, buyPrice, buyQuan
   const buyPoints = useMemo(() => combined.filter((d) => d.signal === "buy"), [combined]);
   const sellPoints = useMemo(() => combined.filter((d) => d.signal === "sell"), [combined]);
 
+  // ── Date range selector (shared between TODAY and historical views) ──────────
+  const RangeSelector = () => (
+    <div style={{ display: "flex", gap: 4, background: "#0f172a", borderRadius: 8, padding: 4 }}>
+      {DATE_RANGE_OPTIONS.map((r) => (
+        <button
+          key={r}
+          onClick={() => setRange(r)}
+          style={{
+            padding: "4px 12px",
+            borderRadius: 6,
+            border: "none",
+            cursor: "pointer",
+            fontSize: 13,
+            fontWeight: 500,
+            background: range === r ? (r === "TODAY" ? "#0d9488" : "#2563eb") : "transparent",
+            color: range === r ? "#fff" : "#64748b",
+            transition: "all 0.15s",
+          }}
+        >
+          {r === "TODAY" ? "Today ◉" : r}
+        </button>
+      ))}
+    </div>
+  );
+
+  // ── TODAY tab: show intraday chart ────────────────────────────────────────
+  if (range === "TODAY") {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+          <RangeSelector />
+          <span style={{ fontSize: 11, color: "#475569" }}>10-minute intraday bars • auto_trainer must be running</span>
+        </div>
+        <TodayChart ticker={ticker} />
+      </div>
+    );
+  }
+
   if (combined.length === 0) {
     return (
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 320, color: "#64748b" }}>
-        No data for selected range
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ display: "flex", alignItems: "center" }}>
+          <RangeSelector />
+        </div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 320, color: "#64748b" }}>
+          No data for selected range
+        </div>
       </div>
     );
   }
@@ -239,27 +582,7 @@ export default function StockChart({ data, futureData, ticker, buyPrice, buyQuan
       <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
 
         {/* Date range buttons */}
-        <div style={{ display: "flex", gap: 4, background: "#0f172a", borderRadius: 8, padding: 4 }}>
-          {DATE_RANGE_OPTIONS.map((r) => (
-            <button
-              key={r}
-              onClick={() => setRange(r)}
-              style={{
-                padding: "4px 12px",
-                borderRadius: 6,
-                border: "none",
-                cursor: "pointer",
-                fontSize: 13,
-                fontWeight: 500,
-                background: range === r ? "#2563eb" : "transparent",
-                color: range === r ? "#fff" : "#64748b",
-                transition: "all 0.15s",
-              }}
-            >
-              {r}
-            </button>
-          ))}
-        </div>
+        <RangeSelector />
 
         {/* Toggle legend */}
         <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>

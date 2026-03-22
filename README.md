@@ -1,194 +1,276 @@
-# NSE Simulator
+# NSE Stock Simulator
 
-A full-stack ML-powered NSE (National Stock Exchange, India) stock prediction simulator.
-Add any NSE ticker and it fetches 2 years of historical data, scrapes Indian financial news,
-scores sentiment with FinBERT, trains an XGBoost model, and shows interactive charts with
-predicted price direction, buy/sell signals, and sentiment overlay.
+A full-stack ML-powered trading simulator for NSE (National Stock Exchange of India) stocks. The system continuously trains and self-improves using Optuna hyperparameter search, provides intraday 10-minute bar predictions, and shows sentiment-aware buy/sell signals.
+
+---
+
+## Features
+
+- **Daily model** — XGBoost classifier + regressor + LSTM ensemble predicting tomorrow's direction and price, trained on 5+ years of historical data.
+- **Intraday model** — Lightweight XGBoost on 10-minute bars, retraining every bar during market hours.
+- **Optuna tuning** — 16-parameter search space, per-ticker persistent studies that get smarter with every refresh.
+- **Live mode** — Polls Yahoo Finance every 5–30 seconds for real-time prices; model vs actual comparison shown live.
+- **Today chart** — New "Today" tab shows 10-minute bars with live predictions, accuracy markers, and 30-second auto-refresh.
+- **Sentiment analysis** — FinBERT-scored news from multiple sources, overlaid on the chart.
+- **Portfolio tracker** — Holdings with current P&L, model signals, and signals confidence.
+- **Institutional flow** — FII/DII data and delivery % as model features.
+- **Sector rotation** — Nifty sector indices as relative-strength features.
+- **Cross-platform** — macOS, Linux, and Windows.
+
+---
+
+## Requirements
+
+| Tool | Minimum version |
+|------|----------------|
+| Python | 3.11 |
+| Node.js | 18 |
+
+---
+
+## Quick Start
+
+### macOS / Linux
+
+```bash
+git clone <repo-url>
+cd nse-simulator
+
+chmod +x start.sh
+./start.sh
+```
+
+### Windows (PowerShell)
+
+```powershell
+# From the project root:
+powershell -ExecutionPolicy Bypass -File start.ps1
+```
+
+Both launchers:
+1. Create a Python virtual environment and install all backend dependencies.
+2. Install Node.js packages for the frontend.
+3. Start the FastAPI backend at **http://localhost:8000**.
+4. Start the Next.js frontend at **http://localhost:3000**.
+
+Open **http://localhost:3000** in your browser and add your first NSE ticker.
+
+> **First run:** Adding a stock triggers a one-time download of the FinBERT model (~500 MB). This takes 2–5 minutes on most connections.
+
+---
+
+## Running the Auto-Trainer
+
+The auto-trainer runs indefinitely, handling both intraday live training and overnight Optuna retrains. Run it in a separate terminal alongside the main server.
+
+### macOS / Linux
+
+```bash
+cd backend
+source .venv/bin/activate
+python auto_trainer.py
+```
+
+### Windows (PowerShell)
+
+```powershell
+cd backend
+.venv\Scripts\Activate.ps1
+python auto_trainer.py
+```
+
+### What it does
+
+**Market hours (9:15 AM – 3:30 PM IST, Mon–Fri) — 10-minute intraday loop:**
+1. Trains the intraday XGBoost model on the last 5 trading days of 10-minute bars.
+2. Predicts the direction and price of the next 10-minute bar for every tracked stock.
+3. Waits ~10 minutes for the bar to close.
+4. Fetches actual prices, records whether the prediction was correct, and prints a running accuracy table.
+5. Retrains on the updated bars.
+6. Repeats until market closes.
+
+**After market close — offline replay + overnight retrain:**
+1. Replays the last 5 days of 10-minute bars sequentially (predict → check → retrain → advance) to measure how accurate the intraday model would have been.
+2. Triggers a full Optuna hyperparameter search for every tracked stock (35–60 trials per stock).
+3. Optionally adds a random stock from the NSE universe.
+4. Sleeps until 9:10 AM IST on the next trading day.
+
+Press **Ctrl+C** to stop cleanly. All models and Optuna studies are saved automatically.
 
 ---
 
 ## Architecture
 
 ```
-Frontend (Next.js :3000)  ←→  Backend (FastAPI :8000)  ←→  SQLite DB
-                                      ↓
-                          yfinance | newspaper3k | PRAW | NewsAPI | NSE API
-                                      ↓
-                          Technical indicators (pandas-ta)
-                          Sentiment scoring (FinBERT / HuggingFace)
-                          XGBoost classifier (walk-forward CV)
-```
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.11+
-- Node.js 18+
-- ~4 GB disk space (FinBERT model download on first run)
-
-### 1. Clone / open the project
-
-```bash
-cd nse-simulator
-```
-
-### 2. Set up backend
-
-```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env
-# Edit .env and fill in your API keys (see below)
-```
-
-### 3. Set up frontend
-
-```bash
-cd frontend
-npm install
-```
-
-### 4. Start everything
-
-From the **project root**:
-
-```bash
-chmod +x start.sh
-./start.sh
-```
-
-Then open [http://localhost:3000](http://localhost:3000).
-
----
-
-## API Keys Setup
-
-### NewsAPI (required for macro Indian news)
-
-1. Go to [https://newsapi.org/register](https://newsapi.org/register)
-2. Sign up for a free account (100 requests/day on free tier)
-3. Copy your API key into `backend/.env`:
-   ```
-   NEWSAPI_KEY=your_key_here
-   ```
-
-### Reddit API (required for r/IndiaInvestments and r/IndianStreetBets posts)
-
-1. Log in to Reddit → go to [https://www.reddit.com/prefs/apps](https://www.reddit.com/prefs/apps)
-2. Click **Create App** → choose **script** type
-3. Set redirect URI to `http://localhost:8080`
-4. Copy the client ID (under the app name) and secret:
-   ```
-   REDDIT_CLIENT_ID=your_client_id
-   REDDIT_CLIENT_SECRET=your_client_secret
-   REDDIT_USER_AGENT=NSESimulator/1.0 by YourUsername
-   ```
-
-> **Note:** The app still works without these keys — news scraping from Economic Times and
-> Moneycontrol will still function, just Reddit and NewsAPI sections will be skipped.
-
----
-
-## First Run Notes
-
-### FinBERT model download
-
-On the first run, the backend will automatically download the `ProsusAI/finbert` model
-from HuggingFace (~500 MB). This happens once and is cached locally at
-`~/.cache/huggingface/transformers/`.
-
-### Pipeline time
-
-When you add a stock for the first time:
-- Price data fetch: ~10 seconds
-- News scraping (ET + Moneycontrol): ~1–2 minutes (polite delays)
-- Reddit fetch: ~30 seconds
-- FinBERT scoring: ~1–3 minutes (depends on hardware, GPU speeds this up significantly)
-- XGBoost training: ~10–30 seconds
-- **Total: 2–5 minutes**
-
-The UI will show a "processing" state and auto-refresh every 15 seconds.
-
----
-
-## Project Structure
-
-```
 nse-simulator/
-├── backend/
-│   ├── main.py                 # FastAPI app + all routes
-│   ├── config.py               # Environment variables, constants
+├── backend/                       FastAPI (Python 3.11)
+│   ├── main.py                    All API routes
+│   ├── auto_trainer.py            Continuous training loop
+│   ├── config.py                  Paths, thresholds, constants
 │   ├── data/
-│   │   ├── price_fetcher.py    # yfinance OHLCV data (IST-aware)
-│   │   ├── nse_announcements.py# NSE India public API
-│   │   ├── news_scraper.py     # Economic Times + Moneycontrol scraper
-│   │   ├── reddit_fetcher.py   # PRAW Reddit fetcher
-│   │   └── macro_news.py       # NewsAPI macro Indian news
+│   │   ├── price_fetcher.py       Daily OHLCV from yfinance
+│   │   ├── intraday_fetcher.py    10-min bars from yfinance
+│   │   ├── live_price_fetcher.py  Live price via yf.fast_info
+│   │   ├── fii_dii_fetcher.py     FII/DII flow from NSE API
+│   │   ├── delivery_fetcher.py    Delivery % from NSE bhav copy
+│   │   ├── news_scraper.py        Web news scraping
+│   │   └── macro_news.py          NewsAPI macro headlines
 │   ├── features/
-│   │   ├── technical.py        # RSI, MACD, Bollinger, EMA, ATR, OBV
-│   │   ├── sentiment.py        # FinBERT scoring + daily aggregation
-│   │   ├── calendar_flags.py   # RBI meetings, F&O expiry, budget day
-│   │   └── feature_builder.py  # Merge all features, no-lookahead safe
+│   │   ├── feature_builder.py     Full daily feature pipeline
+│   │   ├── sector_rotation.py     Nifty sector index signals
+│   │   ├── sentiment.py           FinBERT scoring
+│   │   └── calendar_flags.py      Expiry / earnings calendar
 │   ├── model/
-│   │   ├── train.py            # XGBoost with walk-forward validation
-│   │   ├── predict.py          # Generate historical predictions
-│   │   ├── backtest.py         # Portfolio simulation vs buy-and-hold
-│   │   └── signals.py          # Buy/sell/hold signal generation
-│   ├── db/
-│   │   ├── database.py         # SQLAlchemy engine + session
-│   │   └── models.py           # SQLite tables
-│   └── requirements.txt
-├── frontend/
-│   ├── pages/
-│   │   ├── index.tsx           # Dashboard with stock grid
-│   │   └── stock/[ticker].tsx  # Individual stock detail page
-│   ├── components/
-│   │   ├── StockChart.tsx      # Recharts ComposedChart with all overlays
-│   │   ├── SentimentOverlay.tsx# FinBERT sentiment bar chart
-│   │   ├── StockCard.tsx       # Dashboard card component
-│   │   └── AddStockModal.tsx   # Add stock modal with validation
-│   ├── lib/api.ts              # Typed API client (axios)
-│   └── package.json
-├── start.sh                    # One-command launcher
-└── README.md
+│   │   ├── train.py               Walk-forward CV + XGBoost + LSTM
+│   │   ├── intraday_trainer.py    10-min XGBoost (< 500 ms retrain)
+│   │   ├── predict.py             Daily ensemble prediction
+│   │   ├── tune.py                Optuna 16-param search
+│   │   ├── lstm_model.py          Bidirectional LSTM (PyTorch)
+│   │   ├── backtest.py            OOS portfolio simulation
+│   │   └── signals.py             Buy/sell signal generation
+│   └── db/
+│       ├── models.py              SQLAlchemy ORM models
+│       └── database.py            DB init + schema migrations
+└── frontend/                      Next.js + TypeScript
+    ├── pages/
+    │   ├── index.tsx              Watchlist + portfolio dashboard
+    │   └── stock/[ticker].tsx     Per-stock detail page + Live Mode
+    ├── components/
+    │   └── StockChart.tsx         Recharts (Today / 1M / 3M / 6M / 1Y / All)
+    └── lib/
+        └── api.ts                 API client + TypeScript interfaces
+```
+
+### Model stack
+
+| Component | Purpose |
+|-----------|---------|
+| XGBoost Classifier | Next-day direction (primary signal) |
+| XGBoost Regressor | Next-day price magnitude (log-return) |
+| Bidirectional LSTM | Sequential pattern recognition |
+| Ensemble | 0.55 × XGB + 0.45 × LSTM probability blend |
+| Intraday XGBoost | 10-min direction + price (fast retrain) |
+| Optuna TPE | Per-ticker hyperparameter optimisation (16 params) |
+
+### Daily model features
+
+Technical indicators (RSI, MACD, Bollinger Bands, ATR, EMA crossovers, OBV, Stochastic, ADX), price momentum at 5/10/20/60-day horizons, FII/DII net flow (5-day rolling), equity delivery %, sector index relative strength (5d/20d), FinBERT sentiment scores, NSE corporate announcements, calendar flags (expiry week, earnings, IPO windows).
+
+### Intraday model features
+
+1/2/3/5/10-bar log returns, bar shape (body %, upper/lower wick %, bull/bear flag), volume ratio and z-score, VWAP deviation, RSI-7, EMA-5 vs EMA-15 crossover + deviation, cumulative intraday return from open, ATR ratio (5-bar / 20-bar), time-of-day (bars since open, hour, morning/afternoon/last-hour flags), 10-bar linear regression slope.
+
+---
+
+## API Reference
+
+Full interactive docs at **http://localhost:8000/docs**.
+
+### Stocks
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/stocks` | List all tracked stocks |
+| POST | `/api/stocks` | Add stock `{"ticker": "TCS"}` |
+| DELETE | `/api/stocks/{ticker}` | Remove stock |
+| POST | `/api/stocks/{ticker}/refresh` | Retrain + Optuna search |
+| GET | `/api/stocks/{ticker}/chart` | Historical + 30-day forecast data |
+| GET | `/api/stocks/{ticker}/stats` | Backtest stats (Sharpe, alpha, drawdown) |
+| GET | `/api/stocks/{ticker}/news` | News with FinBERT sentiment scores |
+| GET | `/api/stocks/{ticker}/live` | Live price + model comparison |
+
+### Intraday (10-minute)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/stocks/{ticker}/intraday` | Today's bars + current prediction + session accuracy |
+| POST | `/api/stocks/{ticker}/intraday/train` | Train intraday model on 5-day bars |
+| POST | `/api/stocks/{ticker}/intraday/predict` | Predict next bar + log in session |
+| POST | `/api/stocks/{ticker}/intraday/record-actual` | Record actual `{"actual_price": 3812.50}` |
+| POST | `/api/stocks/{ticker}/intraday/replay` | Offline sequential replay (`?days_back=5`) |
+
+### Portfolio
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/portfolio` | All holdings with P&L |
+| POST | `/api/portfolio` | Add holding |
+| PUT | `/api/portfolio/{ticker}` | Update buy price / quantity |
+| DELETE | `/api/portfolio/{ticker}` | Remove holding |
+
+---
+
+## Configuration
+
+Edit the `CONFIG` block at the top of `backend/auto_trainer.py`:
+
+```python
+BACKEND_URL           = "http://localhost:8000"
+INTRADAY_BAR_SECONDS  = 600    # bar length in seconds (10 min)
+INTRADAY_BAR_BUFFER   = 60     # extra wait after bar close
+SLEEP_BETWEEN_STOCKS  = 30     # gap between overnight pipeline runs
+ADD_NEW_EVERY_N_CYCLES = 2     # add random stock every N overnight cycles
+MAX_STOCKS            = 20     # cap on total tracked stocks
+```
+
+Edit `backend/config.py` for model-level settings (walk-forward window, signal confidence threshold, database path, etc.).
+
+---
+
+## Optuna Tuning Details
+
+The 16-parameter search space covers:
+
+- **Boosting schedule** — `n_estimators` (80–800), `learning_rate` (0.005–0.4 log)
+- **Tree structure** — `max_depth` (2–10), `min_child_weight` (1–50), `max_delta_step` (0–10), `gamma` (0–5)
+- **Regularisation** — `reg_alpha` (log), `reg_lambda` (log)
+- **Sampling** — `subsample`, `colsample_bytree`, `colsample_bylevel`, `colsample_bynode` (all 0.3–1.0)
+- **Grow policy** — depthwise vs lossguide, `max_leaves` (lossguide only)
+- **Class weighting** — `scale_pos_weight` (0.5–2.0)
+
+Studies are saved to `backend/model/saved/<TICKER>_optuna_study.pkl`. To reset a ticker's tuning history:
+
+```bash
+rm backend/model/saved/TCS_optuna_study.pkl
 ```
 
 ---
 
-## API Endpoints
+## Troubleshooting
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/stocks` | List all tracked stocks |
-| POST | `/api/stocks` | Add a ticker (triggers pipeline) |
-| DELETE | `/api/stocks/{ticker}` | Remove a stock |
-| GET | `/api/stocks/{ticker}/chart` | Chart data (prices, predictions, signals) |
-| GET | `/api/stocks/{ticker}/stats` | Backtest statistics |
-| GET | `/api/stocks/{ticker}/news` | Recent news with sentiment |
-| POST | `/api/stocks/{ticker}/refresh` | Re-run pipeline |
-| GET | `/api/health` | Health check |
+**Port 8000 already in use:**
+```bash
+# macOS / Linux
+lsof -ti:8000 | xargs kill -9
 
----
+# Windows PowerShell
+netstat -ano | findstr :8000
+Stop-Process -Id <PID> -Force
+```
 
-## Model Details
+**FinBERT download stuck** — Be patient on first run. The ~500 MB model is a one-time download cached to `~/.cache/huggingface`.
 
-- **Algorithm:** XGBoost classifier (binary: up/down next day)
-- **Validation:** Walk-forward (time-series safe, no random splits)
-- **Features:** ~35 technical indicators + 5 calendar flags + 1 daily sentiment score
-- **Signal threshold:** 60% confidence (configurable in `config.py`)
-- **No lookahead bias:** all features on day T use only data available by EOD T
+**No data in "Today" tab** — The intraday model needs `auto_trainer.py` running, or at least one call to `POST /intraday/train`. The tab works best during NSE market hours (9:15 AM – 3:30 PM IST, Mon–Fri).
+
+**Yahoo Finance rate limiting** — Heavy polling can trigger temporary 429 errors. The system retries with backoff and falls back gracefully.
+
+**FII/DII data unavailable** — NSE's API requires session cookies that expire periodically. After 10 consecutive failures the fetcher returns zeros and the model runs normally.
 
 ---
 
-## Limitations & Disclaimer
+## Data Sources
 
-- This is a **simulator for educational purposes only** — not financial advice
-- Past model accuracy does not guarantee future returns
-- NSE scraping may break if website layouts change
-- Free NewsAPI tier has a 100 req/day limit
-- FinBERT performance degrades on very short headlines
+| Source | Data fetched |
+|--------|-------------|
+| Yahoo Finance (yfinance) | Daily + intraday OHLCV, live prices, sector indices |
+| NSE India API | FII/DII institutional flow, corporate announcements |
+| NSE Bhav Copy Archives | Daily equity delivery percentage |
+| NewsAPI | Macro and company-specific news headlines |
+| Web scrapers | Indian financial news sites |
+| Reddit (r/IndiaInvestments) | Retail investor sentiment |
+
+---
+
+## License
+
+MIT

@@ -749,6 +749,172 @@ def get_live_price(ticker: str, db: Session = Depends(get_db)) -> dict[str, Any]
     return {**live, "model_comparison": model_comparison}
 
 
+# ── Intraday (10-min) Training & Prediction Routes ───────────────────────────
+
+
+class RecordActualRequest(BaseModel):
+    actual_price: float
+
+
+@app.get("/api/stocks/{ticker}/intraday")
+def get_intraday(ticker: str) -> dict[str, Any]:
+    """
+    Return today's 10-min OHLCV bars, the current intraday prediction,
+    and session accuracy stats. Designed to be polled every 30s by the
+    frontend 'Today' chart tab.
+    """
+    from data.intraday_fetcher import fetch_today_bars
+    from model.intraday_trainer import predict_next_bar, get_session_accuracy
+
+    symbol = ticker.upper().replace(".NS", "").replace(".BO", "")
+
+    bars = fetch_today_bars(symbol)
+    session_acc = get_session_accuracy(symbol)
+
+    bars_data: list[dict] = []
+    prediction: dict | None = None
+
+    if not bars.empty:
+        for ts, row in bars.iterrows():
+            bars_data.append({
+                "timestamp": ts.isoformat(),
+                "open":   round(float(row["open"]),   2),
+                "high":   round(float(row["high"]),   2),
+                "low":    round(float(row["low"]),    2),
+                "close":  round(float(row["close"]),  2),
+                "volume": int(row["volume"]),
+            })
+        pred = predict_next_bar(symbol, bars)
+        if pred and "error" not in pred:
+            prediction = pred
+
+    return {
+        "ticker":           symbol,
+        "bars":             bars_data,
+        "prediction":       prediction,
+        "session_accuracy": session_acc,
+    }
+
+
+@app.post("/api/stocks/{ticker}/intraday/train")
+def train_intraday_endpoint(ticker: str) -> dict[str, Any]:
+    """Fetch last 5 days of 10-min bars and (re)train the lightweight intraday model."""
+    from data.intraday_fetcher import fetch_intraday_bars
+    from model.intraday_trainer import train_intraday as _train_intraday
+
+    symbol = ticker.upper().replace(".NS", "").replace(".BO", "")
+    bars = fetch_intraday_bars(symbol, days_back=5)
+    if bars.empty:
+        raise HTTPException(status_code=400, detail="No intraday data available")
+
+    result = _train_intraday(symbol, bars)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    return {"ticker": symbol, **result}
+
+
+@app.post("/api/stocks/{ticker}/intraday/predict")
+def predict_intraday_endpoint(ticker: str) -> dict[str, Any]:
+    """
+    Make a next-10-min prediction using the intraday model and record it
+    in today's session log. Call this after /intraday/train.
+    """
+    from data.intraday_fetcher import fetch_today_bars
+    from model.intraday_trainer import predict_next_bar, record_prediction
+
+    symbol = ticker.upper().replace(".NS", "").replace(".BO", "")
+    bars = fetch_today_bars(symbol)
+    if bars.empty:
+        raise HTTPException(status_code=400, detail="No intraday bars available for today")
+
+    pred = predict_next_bar(symbol, bars)
+    if "error" in pred:
+        raise HTTPException(status_code=400, detail=pred["error"])
+
+    record_prediction(symbol, pred)
+    return {"ticker": symbol, **pred}
+
+
+@app.post("/api/stocks/{ticker}/intraday/record-actual")
+def record_intraday_actual(
+    ticker: str, request: RecordActualRequest,
+) -> dict[str, Any]:
+    """
+    Record the actual close price for the last pending 10-min prediction.
+    Returns whether the prediction was correct and current session accuracy.
+    """
+    from model.intraday_trainer import record_actual, get_session_accuracy
+
+    symbol = ticker.upper().replace(".NS", "").replace(".BO", "")
+    correct = record_actual(symbol, request.actual_price)
+    session = get_session_accuracy(symbol)
+    return {
+        "ticker":            symbol,
+        "prediction_correct": correct,
+        "session_accuracy":  session,
+    }
+
+
+@app.post("/api/stocks/{ticker}/intraday/replay")
+def replay_intraday_endpoint(ticker: str, days_back: int = 5) -> dict[str, Any]:
+    """
+    Offline replay mode (for when market is closed).
+    Walks through the last N days of 10-min bars sequentially:
+      train on bars 0..i → predict bar i+1 → compare actual → advance.
+    Returns cumulative replay accuracy.
+    """
+    import pandas as pd
+    from data.intraday_fetcher import fetch_intraday_bars, split_intraday_for_replay
+    from model.intraday_trainer import (
+        train_intraday as _train_intraday,
+        predict_next_bar,
+    )
+
+    symbol = ticker.upper().replace(".NS", "").replace(".BO", "")
+    all_bars = fetch_intraday_bars(symbol, days_back=days_back)
+    if all_bars.empty:
+        raise HTTPException(status_code=400, detail="No intraday data available")
+
+    day_groups = split_intraday_for_replay(all_bars)
+    total_preds   = 0
+    correct_preds = 0
+    cumulative: pd.DataFrame | None = None
+
+    for day_df in day_groups:
+        for i in range(15, len(day_df) - 1):
+            train_bars = (
+                pd.concat([cumulative, day_df.iloc[:i]]) if cumulative is not None
+                else day_df.iloc[:i]
+            )
+            result = _train_intraday(symbol, train_bars)
+            if "error" in result:
+                continue
+            pred = predict_next_bar(symbol, train_bars)
+            if "error" in pred:
+                continue
+            # Compare prediction against the actual next bar
+            actual_close = float(day_df.iloc[i + 1]["close"])
+            prev_close   = float(day_df.iloc[i]["close"])
+            actual_dir   = 1 if actual_close > prev_close else 0
+            total_preds += 1
+            if actual_dir == pred["direction"]:
+                correct_preds += 1
+
+        cumulative = (
+            pd.concat([cumulative, day_df]) if cumulative is not None else day_df
+        )
+
+    accuracy = round(correct_preds / total_preds, 4) if total_preds > 0 else None
+    return {
+        "ticker":              symbol,
+        "days_replayed":       len(day_groups),
+        "total_predictions":   total_preds,
+        "correct_predictions": correct_preds,
+        "replay_accuracy":     accuracy,
+    }
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "NSE Simulator API"}
