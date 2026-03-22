@@ -282,11 +282,11 @@ def _run_full_pipeline(ticker: str, _unused_db: Session = None) -> None:
             db.commit()
 
         logger.info("Full pipeline completed for %s (accuracy=%.3f)", symbol, accuracy)
+        db.close()
 
         # ── 13. Hyperparameter tuning (runs after pipeline, non-blocking) ─────
         # Optuna searches for better XGBoost params using walk-forward CV.
         # Results are saved to disk and loaded automatically on the next refresh.
-        # The model improves incrementally with each Refresh Data click.
         try:
             from model.tune import tune_hyperparameters
             logger.info("Starting Optuna hyperparameter tuning for %s…", symbol)
@@ -304,9 +304,11 @@ def _run_full_pipeline(ticker: str, _unused_db: Session = None) -> None:
 
     except Exception as exc:
         logger.exception("Pipeline failed for %s: %s", symbol, exc)
-        db.rollback()
+        if 'db' in locals():
+            db.rollback()
     finally:
-        db.close()
+        if 'db' in locals() and db.session.is_active:
+            db.close()
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────

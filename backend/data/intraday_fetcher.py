@@ -1,12 +1,12 @@
 """
-Intraday bar fetcher — NSE stocks, 10-minute resolution.
+Intraday bar fetcher — NSE stocks, 15-minute resolution.
 
 yfinance supports intraday data:
-  interval="10m"  →  available for up to 60 days back
+  interval="15m"  →  available for up to 60 days back
   interval="1m"   →  last 7 days only
 
-We fetch "10m" bars for the last 5 trading days, which gives ~190 bars
-(38 bars/day × 5 days). This is enough for the intraday model to learn
+We fetch "15m" bars for the last 5 trading days, which gives ~125 bars
+(25 bars/day × 5 days). This is enough for the intraday model to learn
 intraday patterns while staying fast to download.
 
 Data is NOT persisted to DB — it's always fetched fresh from Yahoo Finance.
@@ -31,7 +31,7 @@ MARKET_CLOSE_H, MARKET_CLOSE_M = 15, 30
 def fetch_intraday_bars(
     ticker: str,
     days_back: int = 5,
-    interval: str = "10m",
+    interval: str = "15m",
 ) -> pd.DataFrame:
     """
     Fetch intraday OHLCV bars for an NSE stock.
@@ -85,8 +85,8 @@ def fetch_intraday_bars(
 
 
 def fetch_today_bars(ticker: str) -> pd.DataFrame:
-    """Fetch only today's intraday bars (1d period, 10m interval)."""
-    return fetch_intraday_bars(ticker, days_back=1, interval="10m")
+    """Fetch only today's intraday bars (1d period, 15m interval)."""
+    return fetch_intraday_bars(ticker, days_back=1, interval="15m")
 
 
 def split_intraday_for_replay(df: pd.DataFrame):

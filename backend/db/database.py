@@ -21,6 +21,7 @@ engine = create_engine(
     # PostgreSQL: use a connection pool sized for the server
     pool_size=5 if not _IS_SQLITE else 5,
     max_overflow=10 if not _IS_SQLITE else 0,
+    pool_pre_ping=True,
     echo=False,
 )
 
