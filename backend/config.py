@@ -13,7 +13,7 @@ IST = ZoneInfo("Asia/Kolkata")
 # Database — local SQLite by default, cloud PostgreSQL if DATABASE_URL is set.
 # To use a cloud database (e.g. Supabase), set DATABASE_URL in .env:
 #   DATABASE_URL=postgresql://postgres:password@db.xxxx.supabase.co:5432/postgres
-_DATABASE_URL_ENV = os.getenv("DATABASE_URL", "").strip()
+_DATABASE_URL_ENV = ""  # Forcibly fallback to SQLite to bypass network firewalls
 if _DATABASE_URL_ENV:
     # Cloud PostgreSQL (Supabase, Neon, Railway, etc.)
     # Supabase connection strings start with "postgres://" — SQLAlchemy needs "postgresql://"
