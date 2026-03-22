@@ -1,101 +1,315 @@
 # NSE Stock Simulator
 
-A full-stack ML-powered trading simulator for NSE (National Stock Exchange of India) stocks. The system continuously trains and self-improves using Optuna hyperparameter search, provides intraday 10-minute bar predictions, and shows sentiment-aware buy/sell signals.
+A full-stack, self-improving ML trading simulator for NSE (National Stock Exchange of India) stocks. Add any NSE ticker and the system fetches years of historical data, scrapes news, scores sentiment with FinBERT, trains an XGBoost + LSTM ensemble, and continuously improves itself through Optuna hyperparameter search — all while tracking predictions against real prices in real time.
 
 ---
 
-## Features
+## Table of Contents
 
-- **Daily model** — XGBoost classifier + regressor + LSTM ensemble predicting tomorrow's direction and price, trained on 5+ years of historical data.
-- **Intraday model** — Lightweight XGBoost on 10-minute bars, retraining every bar during market hours.
-- **Optuna tuning** — 16-parameter search space, per-ticker persistent studies that get smarter with every refresh.
-- **Live mode** — Polls Yahoo Finance every 5–30 seconds for real-time prices; model vs actual comparison shown live.
-- **Today chart** — New "Today" tab shows 10-minute bars with live predictions, accuracy markers, and 30-second auto-refresh.
-- **Sentiment analysis** — FinBERT-scored news from multiple sources, overlaid on the chart.
-- **Portfolio tracker** — Holdings with current P&L, model signals, and signals confidence.
-- **Institutional flow** — FII/DII data and delivery % as model features.
-- **Sector rotation** — Nifty sector indices as relative-strength features.
-- **Cross-platform** — macOS, Linux, and Windows.
+1. [What It Does](#what-it-does)
+2. [How It Works — End to End](#how-it-works--end-to-end)
+3. [The Auto-Bot](#the-auto-bot)
+4. [The Models](#the-models)
+5. [Features Explained](#features-explained)
+6. [Requirements & Setup](#requirements--setup)
+7. [Running Everything](#running-everything)
+8. [The Dashboard](#the-dashboard)
+9. [Cloud Database Sync](#cloud-database-sync)
+10. [Architecture](#architecture)
+11. [API Reference](#api-reference)
+12. [Configuration](#configuration)
+13. [Troubleshooting](#troubleshooting)
 
 ---
 
-## Requirements
+## What It Does
 
-| Tool | Minimum version |
-|------|----------------|
+You type in a ticker like `TCS` or `PVRINOX`. The system:
+
+- Fetches **5+ years** of daily price data and builds a full feature set (technical indicators, institutional flows, sentiment, sector signals).
+- Trains an **XGBoost + LSTM ensemble** and runs **Optuna hyperparameter search** to find the best model parameters for that specific stock.
+- Shows you a **price chart** with the model's historical predictions overlaid, a **30-day forward forecast**, and **buy/sell signals**.
+- Runs a **10-minute intraday prediction loop** during market hours — predicting where the stock goes every 10 minutes, checking whether it was right, and retraining on the latest data.
+- Tracks a **live price feed** you can toggle on — showing the model's prediction vs what the stock is actually doing right now.
+- Keeps all data in a **cloud PostgreSQL database** (Supabase) so everything syncs between your Mac and Windows machines.
+
+---
+
+## How It Works — End to End
+
+### When you add a stock
+
+1. **Price data** — 5 years of daily OHLCV is downloaded from Yahoo Finance.
+2. **News** — headlines are scraped from Indian financial news sites, NewsAPI, Reddit (r/IndiaInvestments), and NSE corporate announcements.
+3. **Sentiment** — every headline is scored by **FinBERT** (a financial BERT model) into `bullish / bearish / neutral` with a numeric score. These scores become model features.
+4. **Institutional data** — FII/DII (Foreign/Domestic Institutional Investor) net buy/sell flow is fetched from NSE's API. This tells you whether institutions are accumulating or distributing.
+5. **Delivery %** — fetched from NSE's daily bhav copy archive. High delivery % means conviction buying/selling rather than intraday noise.
+6. **Sector signals** — the Nifty sector index that the stock belongs to (e.g. `^CNXIT` for IT stocks) is fetched. Its 5-day and 20-day returns and percentile rank become features — this captures sector rotation.
+7. **Feature engineering** — all of the above is combined into ~60 features per trading day.
+8. **Walk-forward training** — the model is trained using expanding-window cross-validation (no lookahead bias). Each fold trains on everything up to a point, validates on the next 63 trading days, and the accuracy score reported is the average across all out-of-sample folds.
+9. **Optuna tuning** — 35 Optuna trials run in the background, searching across 16 XGBoost hyperparameters to find the best combination for this specific stock. Studies are saved to disk and every subsequent refresh adds more trials — the model keeps getting smarter.
+10. **LSTM training** — a bidirectional 2-layer LSTM is trained on the same feature set to capture sequential patterns XGBoost misses.
+11. **Predictions** — the ensemble (55% XGBoost + 45% LSTM) generates historical predictions (for the chart), a 30-day forward forecast, and a precise price estimate for tomorrow.
+12. **Backtest** — a simulated portfolio starting at ₹1,00,000 trades the model's signals out-of-sample. The reported Sharpe ratio, alpha, drawdown, and model return all come from this honest OOS backtest.
+
+### On every refresh
+
+The entire pipeline above re-runs. Optuna adds more trials to the existing study — it's not starting from scratch, it's building on everything it learned before. Over time, the model converges on the optimal hyperparameters for each stock.
+
+---
+
+## The Auto-Bot
+
+`auto_trainer.py` is a background process that runs indefinitely and drives the entire self-improvement loop. You start it once and leave it running.
+
+### During market hours (9:15 AM – 3:30 PM IST, Mon–Fri)
+
+The bot enters a **10-minute intraday prediction loop**:
+
+```
+Initial setup:
+  └── For each stock: fetch 5 days of 10-min bars → train intraday model
+
+Every 10 minutes:
+  ├── For each stock: predict the next bar's direction + price
+  ├── Display prediction table (ticker | direction | confidence | predicted price | range)
+  ├── Wait for the next 10-min bar to close (~10 min + buffer)
+  ├── Fetch actual live prices
+  ├── Record whether each prediction was correct
+  ├── Retrain on the new bar
+  └── Display session accuracy table (ticker | correct/wrong | session %)
+```
+
+The intraday model trains in under 500ms per stock, so retraining after every bar is fast. The session accuracy resets every day at midnight.
+
+### After market close
+
+```
+1. Offline replay
+   └── For each stock, walk through last 5 days of 10-min bars:
+       train on history → predict next bar → check actual → retrain → advance
+       (measures what intraday accuracy would have been)
+
+2. Overnight Optuna retrain
+   └── For each stock: run full pipeline + 35–60 new Optuna trials
+       (builds on previous study knowledge, converges toward optimal params)
+
+3. Random discovery (every 2 cycles)
+   └── Pick a random stock from 60+ NSE universe tickers and add it
+       (the bot explores stocks you haven't manually added)
+
+4. Sleep until 9:10 AM IST on next trading day
+```
+
+### What "self-improving" means in practice
+
+- **Cycle 1** (day 1): Optuna has 35 trials. It's still exploring broadly.
+- **Cycle 10** (day 5): 350 trials accumulated. TPE sampler has identified which parameter regions work well for this stock.
+- **Cycle 30** (day 15): 1,000+ trials. Model has converged — further trials only make marginal improvements. The bot notices this and reduces search to exploitation mode.
+
+Each stock has its own isolated Optuna study. TCS's optimal parameters have nothing to do with PVRINOX's — they're learned independently.
+
+---
+
+## The Models
+
+### Daily Ensemble
+
+| Component | Role | Weight |
+|-----------|------|--------|
+| XGBoost Classifier | Predicts direction (up/down) | 55% |
+| XGBoost Regressor | Predicts return magnitude (log-return) | — |
+| Bidirectional LSTM | Captures multi-day sequential patterns | 45% |
+
+The ensemble blends XGBoost and LSTM probabilities: `P(up) = 0.55 × xgb_prob + 0.45 × lstm_prob`. The regressor's output converts direction + magnitude into an actual predicted price (e.g. "up 0.8% → ₹3,847").
+
+**Walk-forward cross-validation** prevents any lookahead bias. The model is never evaluated on data it trained on.
+
+### Intraday Model
+
+A lightweight XGBoost classifier + regressor trained specifically on 10-minute bars. Designed to retrain in under 500ms so it can update every single bar without slowing anything down. Uses 20+ intraday-specific features (bar shape, VWAP deviation, time-of-day, volume anomalies) that don't exist in daily data.
+
+### Optuna Hyperparameter Search
+
+**16 parameters searched per stock:**
+
+| Category | Parameters |
+|----------|-----------|
+| Boosting schedule | `n_estimators` (80–800), `learning_rate` (0.005–0.4) |
+| Tree structure | `max_depth` (2–10), `min_child_weight` (1–50), `gamma` (0–5), `max_delta_step` (0–10) |
+| Regularisation | `reg_alpha`, `reg_lambda` (both log-scale) |
+| Feature sampling | `colsample_bytree`, `colsample_bylevel`, `colsample_bynode` (0.3–1.0) |
+| Row sampling | `subsample` (0.4–1.0) |
+| Tree policy | `grow_policy` (depthwise / lossguide), `max_leaves` |
+| Class balance | `scale_pos_weight` (0.5–2.0) |
+
+The `lossguide` grow policy is LightGBM-style leaf-wise splitting — for some stocks it outperforms the standard depth-wise approach by a significant margin. Optuna discovers which is better per ticker.
+
+---
+
+## Features Explained
+
+### Daily model — ~60 features
+
+**Technical indicators**
+RSI(14), MACD signal/histogram, Bollinger Band position, ATR, EMA crossovers (8/21/50/200), OBV, Stochastic %K/%D, ADX, Williams %R, CCI.
+
+**Price momentum**
+Log returns at 1/5/10/20/60 day horizons. Rolling volatility. 52-week high/low distance.
+
+**Institutional flow**
+FII net buy/sell (today + 5-day rolling), DII net buy/sell (today + 5-day rolling), combined FII+DII net. Sourced from NSE's official API.
+
+**Delivery %**
+Daily equity delivery percentage from NSE bhav copy archives. High delivery = real money moving, not intraday speculation. Includes 5-day rolling average and a spike flag (>1.5× 20-day average).
+
+**Sector rotation**
+5-day and 20-day return of the stock's Nifty sector index. Rolling percentile rank (sector momentum). Whether the sector index is above its 50-day MA. Stocks in strong sectors tend to outperform regardless of company-specific news.
+
+**Sentiment**
+Daily average FinBERT score across all news for that stock. Number of bullish/bearish articles. Separate scores for company news vs macro news. NSE announcement flag (results, dividends, board meetings).
+
+**Calendar**
+F&O expiry week flag, last trading day of month, earnings season flag (Apr/Jul/Oct/Jan), budget week flag.
+
+### Intraday model — ~25 features
+
+Log returns over last 1/2/3/5/10 bars, bar body % (open-to-close / high-to-low), upper and lower wick %, bull bar flag, volume ratio vs 10-bar average, volume z-score, VWAP deviation, RSI(7), EMA-5 vs EMA-15 crossover and deviation, cumulative intraday return from open, ATR ratio (5-bar vs 20-bar), bars since open, hour of day, morning/afternoon/last-hour flags, 10-bar linear regression slope.
+
+---
+
+## Requirements & Setup
+
+### Requirements
+
+| Tool | Minimum |
+|------|---------|
 | Python | 3.11 |
 | Node.js | 18 |
 
----
+### First-time setup
 
-## Quick Start
-
-### macOS / Linux
-
+**macOS / Linux:**
 ```bash
 git clone <repo-url>
 cd nse-simulator
-
 chmod +x start.sh
 ./start.sh
 ```
 
-### Windows (PowerShell)
-
+**Windows (PowerShell):**
 ```powershell
-# From the project root:
 powershell -ExecutionPolicy Bypass -File start.ps1
 ```
 
-Both launchers:
-1. Create a Python virtual environment and install all backend dependencies.
-2. Install Node.js packages for the frontend.
-3. Start the FastAPI backend at **http://localhost:8000**.
-4. Start the Next.js frontend at **http://localhost:3000**.
+Both launchers create the Python venv, install all dependencies, and start both servers. Open **http://localhost:3000**.
 
-Open **http://localhost:3000** in your browser and add your first NSE ticker.
+> **Note:** The first time you add a stock, FinBERT (~500 MB) downloads automatically. Give it 2–5 minutes.
 
-> **First run:** Adding a stock triggers a one-time download of the FinBERT model (~500 MB). This takes 2–5 minutes on most connections.
+### Environment variables
+
+Copy `backend/.env.example` to `backend/.env` and fill in:
+
+```bash
+# Optional — for news fetching
+NEWSAPI_KEY=your_key_here
+
+# Optional — for Reddit sentiment
+REDDIT_CLIENT_ID=your_id
+REDDIT_CLIENT_SECRET=your_secret
+
+# Optional — for cloud DB sync across machines (see below)
+DATABASE_URL=postgresql://...
+```
 
 ---
 
-## Running the Auto-Trainer
+## Running Everything
 
-The auto-trainer runs indefinitely, handling both intraday live training and overnight Optuna retrains. Run it in a separate terminal alongside the main server.
+You need **two terminals** running at the same time.
 
-### macOS / Linux
-
+**Terminal 1 — Main server:**
 ```bash
+# macOS / Linux
+./start.sh
+
+# Windows
+powershell -ExecutionPolicy Bypass -File start.ps1
+```
+
+**Terminal 2 — Auto-bot:**
+```bash
+# macOS / Linux
 cd backend
 source .venv/bin/activate
 python auto_trainer.py
-```
 
-### Windows (PowerShell)
-
-```powershell
+# Windows
 cd backend
 .venv\Scripts\Activate.ps1
 python auto_trainer.py
 ```
 
-### What it does
+The main server handles the web UI and API. The auto-bot handles all training and prediction loops. They communicate over the local API — the bot calls the same endpoints the browser does.
 
-**Market hours (9:15 AM – 3:30 PM IST, Mon–Fri) — 10-minute intraday loop:**
-1. Trains the intraday XGBoost model on the last 5 trading days of 10-minute bars.
-2. Predicts the direction and price of the next 10-minute bar for every tracked stock.
-3. Waits ~10 minutes for the bar to close.
-4. Fetches actual prices, records whether the prediction was correct, and prints a running accuracy table.
-5. Retrains on the updated bars.
-6. Repeats until market closes.
+You can run without the auto-bot (the web UI still works, you just won't get intraday predictions or automatic overnight retrains). The bot is what makes the system self-improving.
 
-**After market close — offline replay + overnight retrain:**
-1. Replays the last 5 days of 10-minute bars sequentially (predict → check → retrain → advance) to measure how accurate the intraday model would have been.
-2. Triggers a full Optuna hyperparameter search for every tracked stock (35–60 trials per stock).
-3. Optionally adds a random stock from the NSE universe.
-4. Sleeps until 9:10 AM IST on the next trading day.
+---
 
-Press **Ctrl+C** to stop cleanly. All models and Optuna studies are saved automatically.
+## The Dashboard
+
+### Watchlist (home page)
+
+Lists all tracked stocks with their current model accuracy, last refresh time, and a quick signal indicator. Add any NSE ticker by typing it in the search bar — the system validates it and starts the pipeline automatically.
+
+### Stock detail page
+
+**Live price panel** — shows real-time price, open/high/low, previous close, and change from open. Toggle **Live Mode** to poll every 5/10/30/60 seconds.
+
+**Model vs Reality box** — appears in Live Mode. Shows what the model predicted for today (up/down, target price) vs what the stock is actually doing. Turns green when converging, orange when diverging.
+
+**Stats row:**
+- **Model Accuracy** — walk-forward CV accuracy (honest out-of-sample, not in-sample)
+- **Sharpe Ratio** — risk-adjusted return of the model's trading strategy in backtest
+- **Model Return** — cumulative return of following the model's signals in backtest
+- **Buy & Hold** — what you'd have made just holding the stock
+- **Alpha** — model return minus buy & hold (the model's actual edge)
+- **Max Drawdown** — worst peak-to-trough loss in the backtest
+- **Trading Days** — number of days in the backtest period
+
+**Price chart** has six tabs:
+
+| Tab | What it shows |
+|-----|--------------|
+| **Today** | 10-minute intraday bars with live predictions. Green dots = correct past predictions, red = wrong. Orange dotted line = model's next-bar prediction. Auto-refreshes every 30s. |
+| **1M / 3M / 6M / 1Y / ALL** | Daily closing prices with model's historical predictions, initial vs updated prediction lines, confidence bands, buy/sell signal dots, sentiment overlay, and 30-day forward forecast. |
+
+**Tomorrow's prediction card** — shown when Live Mode is off. Displays the ensemble's precise price estimate for tomorrow with confidence bands (XGBoost + LSTM contributions shown separately).
+
+**Recent news** — all scraped headlines with FinBERT sentiment labels, source, and age.
+
+---
+
+## Cloud Database Sync
+
+By default the system stores everything in a local SQLite file. To sync data between machines (e.g. your Mac and a Windows PC), point both to the same cloud PostgreSQL database.
+
+**Recommended: Supabase (free, no credit card needed)**
+
+1. Go to [supabase.com](https://supabase.com) → create a new project.
+2. **Settings → Database → Connection string** → copy the **Transaction pooler** URL (not the direct connection URL — the direct one may not resolve from outside Supabase's network).
+3. Paste it into `backend/.env`:
+
+```bash
+DATABASE_URL=postgresql://postgres.xxxx:password@aws-0-ap-south-1.pooler.supabase.com:6543/postgres
+```
+
+4. Do the same on your other machine's `.env`.
+5. Restart the backend — it automatically creates all tables on startup.
+
+**What syncs:** stocks, predictions, news, portfolio holdings, sentiment scores.
+
+**What stays local:** ML model weights (`.joblib`), LSTM weights (`.pt`), Optuna studies (`.pkl`), intraday session logs. These are machine-specific and too large for a database anyway.
 
 ---
 
@@ -103,62 +317,50 @@ Press **Ctrl+C** to stop cleanly. All models and Optuna studies are saved automa
 
 ```
 nse-simulator/
-├── backend/                       FastAPI (Python 3.11)
-│   ├── main.py                    All API routes
-│   ├── auto_trainer.py            Continuous training loop
-│   ├── config.py                  Paths, thresholds, constants
+├── backend/                        FastAPI (Python 3.11)
+│   ├── main.py                     All 20+ API routes
+│   ├── auto_trainer.py             Self-improving training bot
+│   ├── config.py                   Env vars, paths, constants
+│   │
 │   ├── data/
-│   │   ├── price_fetcher.py       Daily OHLCV from yfinance
-│   │   ├── intraday_fetcher.py    10-min bars from yfinance
-│   │   ├── live_price_fetcher.py  Live price via yf.fast_info
-│   │   ├── fii_dii_fetcher.py     FII/DII flow from NSE API
-│   │   ├── delivery_fetcher.py    Delivery % from NSE bhav copy
-│   │   ├── news_scraper.py        Web news scraping
-│   │   └── macro_news.py          NewsAPI macro headlines
+│   │   ├── price_fetcher.py        5-year daily OHLCV (yfinance)
+│   │   ├── intraday_fetcher.py     10-min bars (yfinance)
+│   │   ├── live_price_fetcher.py   Real-time price (yf.fast_info)
+│   │   ├── fii_dii_fetcher.py      Institutional flow (NSE API)
+│   │   ├── delivery_fetcher.py     Delivery % (NSE bhav copy)
+│   │   ├── news_scraper.py         Indian financial news sites
+│   │   ├── macro_news.py           Macro headlines (NewsAPI)
+│   │   ├── nse_announcements.py    Corporate filings (NSE)
+│   │   └── reddit_fetcher.py       Reddit sentiment (PRAW)
+│   │
 │   ├── features/
-│   │   ├── feature_builder.py     Full daily feature pipeline
-│   │   ├── sector_rotation.py     Nifty sector index signals
-│   │   ├── sentiment.py           FinBERT scoring
-│   │   └── calendar_flags.py      Expiry / earnings calendar
+│   │   ├── feature_builder.py      Master feature pipeline (~60 features)
+│   │   ├── sector_rotation.py      Nifty sector index signals
+│   │   ├── sentiment.py            FinBERT scoring + aggregation
+│   │   └── calendar_flags.py       Expiry, earnings, budget flags
+│   │
 │   ├── model/
-│   │   ├── train.py               Walk-forward CV + XGBoost + LSTM
-│   │   ├── intraday_trainer.py    10-min XGBoost (< 500 ms retrain)
-│   │   ├── predict.py             Daily ensemble prediction
-│   │   ├── tune.py                Optuna 16-param search
-│   │   ├── lstm_model.py          Bidirectional LSTM (PyTorch)
-│   │   ├── backtest.py            OOS portfolio simulation
-│   │   └── signals.py             Buy/sell signal generation
+│   │   ├── train.py                Walk-forward CV + XGBoost + LSTM training
+│   │   ├── intraday_trainer.py     10-min model (<500ms retrain)
+│   │   ├── predict.py              Daily ensemble prediction + 30-day forecast
+│   │   ├── tune.py                 Optuna 16-param TPE search
+│   │   ├── lstm_model.py           Bidirectional 2-layer LSTM (PyTorch)
+│   │   ├── backtest.py             OOS portfolio simulation
+│   │   └── signals.py              Buy/sell signal generation
+│   │
 │   └── db/
-│       ├── models.py              SQLAlchemy ORM models
-│       └── database.py            DB init + schema migrations
-└── frontend/                      Next.js + TypeScript
+│       ├── models.py               SQLAlchemy ORM (Stock, Prediction, News, Portfolio)
+│       └── database.py             Engine + migrations (SQLite / PostgreSQL)
+│
+└── frontend/                       Next.js + TypeScript
     ├── pages/
-    │   ├── index.tsx              Watchlist + portfolio dashboard
-    │   └── stock/[ticker].tsx     Per-stock detail page + Live Mode
+    │   ├── index.tsx               Watchlist + portfolio overview
+    │   └── stock/[ticker].tsx      Stock detail + Live Mode + Tomorrow card
     ├── components/
-    │   └── StockChart.tsx         Recharts (Today / 1M / 3M / 6M / 1Y / All)
+    │   └── StockChart.tsx          Today (intraday) + historical chart tabs
     └── lib/
-        └── api.ts                 API client + TypeScript interfaces
+        └── api.ts                  Typed API client
 ```
-
-### Model stack
-
-| Component | Purpose |
-|-----------|---------|
-| XGBoost Classifier | Next-day direction (primary signal) |
-| XGBoost Regressor | Next-day price magnitude (log-return) |
-| Bidirectional LSTM | Sequential pattern recognition |
-| Ensemble | 0.55 × XGB + 0.45 × LSTM probability blend |
-| Intraday XGBoost | 10-min direction + price (fast retrain) |
-| Optuna TPE | Per-ticker hyperparameter optimisation (16 params) |
-
-### Daily model features
-
-Technical indicators (RSI, MACD, Bollinger Bands, ATR, EMA crossovers, OBV, Stochastic, ADX), price momentum at 5/10/20/60-day horizons, FII/DII net flow (5-day rolling), equity delivery %, sector index relative strength (5d/20d), FinBERT sentiment scores, NSE corporate announcements, calendar flags (expiry week, earnings, IPO windows).
-
-### Intraday model features
-
-1/2/3/5/10-bar log returns, bar shape (body %, upper/lower wick %, bull/bear flag), volume ratio and z-score, VWAP deviation, RSI-7, EMA-5 vs EMA-15 crossover + deviation, cumulative intraday return from open, ATR ratio (5-bar / 20-bar), time-of-day (bars since open, hour, morning/afternoon/last-hour flags), 10-bar linear regression slope.
 
 ---
 
@@ -170,30 +372,30 @@ Full interactive docs at **http://localhost:8000/docs**.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/stocks` | List all tracked stocks |
+| GET | `/api/stocks` | List all tracked stocks with metadata |
 | POST | `/api/stocks` | Add stock `{"ticker": "TCS"}` |
-| DELETE | `/api/stocks/{ticker}` | Remove stock |
-| POST | `/api/stocks/{ticker}/refresh` | Retrain + Optuna search |
-| GET | `/api/stocks/{ticker}/chart` | Historical + 30-day forecast data |
+| DELETE | `/api/stocks/{ticker}` | Remove stock and all its data |
+| POST | `/api/stocks/{ticker}/refresh` | Re-run full pipeline + Optuna |
+| GET | `/api/stocks/{ticker}/chart` | Historical predictions + 30-day forecast |
 | GET | `/api/stocks/{ticker}/stats` | Backtest stats (Sharpe, alpha, drawdown) |
-| GET | `/api/stocks/{ticker}/news` | News with FinBERT sentiment scores |
-| GET | `/api/stocks/{ticker}/live` | Live price + model comparison |
+| GET | `/api/stocks/{ticker}/news` | News with FinBERT sentiment |
+| GET | `/api/stocks/{ticker}/live` | Live price + model vs reality comparison |
 
-### Intraday (10-minute)
+### Intraday
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/stocks/{ticker}/intraday` | Today's bars + current prediction + session accuracy |
-| POST | `/api/stocks/{ticker}/intraday/train` | Train intraday model on 5-day bars |
-| POST | `/api/stocks/{ticker}/intraday/predict` | Predict next bar + log in session |
-| POST | `/api/stocks/{ticker}/intraday/record-actual` | Record actual `{"actual_price": 3812.50}` |
-| POST | `/api/stocks/{ticker}/intraday/replay` | Offline sequential replay (`?days_back=5`) |
+| GET | `/api/stocks/{ticker}/intraday` | Today's 10-min bars + prediction + session accuracy |
+| POST | `/api/stocks/{ticker}/intraday/train` | Train intraday model on last 5 days |
+| POST | `/api/stocks/{ticker}/intraday/predict` | Make next-bar prediction + record it |
+| POST | `/api/stocks/{ticker}/intraday/record-actual` | Record actual price `{"actual_price": 986.50}` |
+| POST | `/api/stocks/{ticker}/intraday/replay` | Offline sequential replay `?days_back=5` |
 
 ### Portfolio
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/portfolio` | All holdings with P&L |
+| GET | `/api/portfolio` | All holdings with current P&L |
 | POST | `/api/portfolio` | Add holding |
 | PUT | `/api/portfolio/{ticker}` | Update buy price / quantity |
 | DELETE | `/api/portfolio/{ticker}` | Remove holding |
@@ -202,37 +404,40 @@ Full interactive docs at **http://localhost:8000/docs**.
 
 ## Configuration
 
-Edit the `CONFIG` block at the top of `backend/auto_trainer.py`:
-
+**`backend/auto_trainer.py` — bot config:**
 ```python
-BACKEND_URL           = "http://localhost:8000"
-INTRADAY_BAR_SECONDS  = 600    # bar length in seconds (10 min)
-INTRADAY_BAR_BUFFER   = 60     # extra wait after bar close
-SLEEP_BETWEEN_STOCKS  = 30     # gap between overnight pipeline runs
-ADD_NEW_EVERY_N_CYCLES = 2     # add random stock every N overnight cycles
-MAX_STOCKS            = 20     # cap on total tracked stocks
+BACKEND_URL            = "http://localhost:8000"
+INTRADAY_BAR_SECONDS   = 600   # 10-minute bars
+INTRADAY_BAR_BUFFER    = 60    # extra wait after bar close (seconds)
+SLEEP_BETWEEN_STOCKS   = 30    # pause between overnight pipeline runs
+ADD_NEW_EVERY_N_CYCLES = 2     # discover new stocks every N overnight cycles
+MAX_STOCKS             = 20    # cap on tracked stocks (raise to explore more)
 ```
 
-Edit `backend/config.py` for model-level settings (walk-forward window, signal confidence threshold, database path, etc.).
+**`backend/config.py` — model config:**
+```python
+WALK_FORWARD_WINDOW        = 252   # ~1 year of training minimum
+SIGNAL_CONFIDENCE_THRESHOLD = 0.60  # minimum confidence for buy/sell signal
+HISTORY_YEARS              = 5     # years of daily data to fetch
+```
 
----
-
-## Optuna Tuning Details
-
-The 16-parameter search space covers:
-
-- **Boosting schedule** — `n_estimators` (80–800), `learning_rate` (0.005–0.4 log)
-- **Tree structure** — `max_depth` (2–10), `min_child_weight` (1–50), `max_delta_step` (0–10), `gamma` (0–5)
-- **Regularisation** — `reg_alpha` (log), `reg_lambda` (log)
-- **Sampling** — `subsample`, `colsample_bytree`, `colsample_bylevel`, `colsample_bynode` (all 0.3–1.0)
-- **Grow policy** — depthwise vs lossguide, `max_leaves` (lossguide only)
-- **Class weighting** — `scale_pos_weight` (0.5–2.0)
-
-Studies are saved to `backend/model/saved/<TICKER>_optuna_study.pkl`. To reset a ticker's tuning history:
-
+To reset a stock's Optuna tuning history (start fresh):
 ```bash
 rm backend/model/saved/TCS_optuna_study.pkl
 ```
+
+---
+
+## Data Sources
+
+| Source | What's fetched |
+|--------|---------------|
+| Yahoo Finance | 5-year daily OHLCV, 10-min intraday bars, live prices, Nifty sector indices |
+| NSE India API | FII/DII net institutional flow, corporate announcements |
+| NSE Bhav Copy | Daily equity delivery % |
+| NewsAPI | Macro and company news headlines |
+| Web scrapers | Moneycontrol, Economic Times, LiveMint, and other Indian financial sites |
+| Reddit | r/IndiaInvestments — retail investor sentiment |
 
 ---
 
@@ -248,26 +453,15 @@ netstat -ano | findstr :8000
 Stop-Process -Id <PID> -Force
 ```
 
-**FinBERT download stuck** — Be patient on first run. The ~500 MB model is a one-time download cached to `~/.cache/huggingface`.
+**FinBERT slow to download** — one-time ~500 MB download on first stock add, cached at `~/.cache/huggingface`. Don't interrupt it.
 
-**No data in "Today" tab** — The intraday model needs `auto_trainer.py` running, or at least one call to `POST /intraday/train`. The tab works best during NSE market hours (9:15 AM – 3:30 PM IST, Mon–Fri).
+**"Today" tab shows no bars** — market is closed (or it's a weekend/holiday), OR `auto_trainer.py` is not running. The tab auto-refreshes every 30s and will populate as soon as bars exist.
 
-**Yahoo Finance rate limiting** — Heavy polling can trigger temporary 429 errors. The system retries with backoff and falls back gracefully.
+**Supabase connection fails** — use the **Transaction Pooler** URL from Supabase (Settings → Database → Connection string), not the direct connection URL. The direct URL's hostname (`db.xxx.supabase.co`) may not resolve from outside Supabase's network.
 
-**FII/DII data unavailable** — NSE's API requires session cookies that expire periodically. After 10 consecutive failures the fetcher returns zeros and the model runs normally.
+**FII/DII returns zeros** — NSE's API requires browser-like session cookies that expire. The fetcher retries up to 10 times and falls back to zeros silently. The model still runs normally.
 
----
-
-## Data Sources
-
-| Source | Data fetched |
-|--------|-------------|
-| Yahoo Finance (yfinance) | Daily + intraday OHLCV, live prices, sector indices |
-| NSE India API | FII/DII institutional flow, corporate announcements |
-| NSE Bhav Copy Archives | Daily equity delivery percentage |
-| NewsAPI | Macro and company-specific news headlines |
-| Web scrapers | Indian financial news sites |
-| Reddit (r/IndiaInvestments) | Retail investor sentiment |
+**Model accuracy stuck at ~50%** — this is normal for volatile stocks. The model is reporting honest out-of-sample accuracy. Run the auto-bot overnight to accumulate Optuna trials — accuracy typically improves 1–3% over the first week.
 
 ---
 

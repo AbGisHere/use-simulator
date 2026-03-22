@@ -42,12 +42,23 @@ coverage.xml
 !.env.example
 
 # ── Application data ───────────────────────────────────────────────────────────
+# SQLite (local fallback — not used when DATABASE_URL is set)
 backend/data/nse_simulator.db
 backend/data/nse_simulator.db-shm
 backend/data/nse_simulator.db-wal
 
-# Trained ML models
+# FinBERT / HuggingFace cache (downloaded at runtime, can be hundreds of MB)
+backend/data/finbert/
+backend/data/models/
+.cache/
+
+# Trained ML models — all saved model/study files stay local, never commit
 backend/model/saved/*.joblib
+backend/model/saved/*.pt
+backend/model/saved/*.pkl
+
+# Intraday session accuracy logs (reset daily, machine-specific)
+backend/model/saved/*_intraday_session.json
 
 # Jupyter
 .ipynb_checkpoints/
