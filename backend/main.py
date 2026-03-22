@@ -20,7 +20,7 @@ from db.models import NewsCache, PortfolioHolding, PortfolioSim, Prediction, Sto
 from features.feature_builder import build_features
 from features.sentiment import score_news_items
 from model.backtest import run_backtest
-from model.predict import generate_predictions, generate_future_predictions
+from model.predict import generate_predictions, generate_future_predictions, predict_tomorrow
 from model.signals import generate_signals
 from model.train import model_exists, train_model
 
@@ -152,7 +152,7 @@ def _run_full_pipeline(ticker: str, _unused_db: Session = None) -> None:
         db.commit()
 
         # ── 6. Build features ─────────────────────────────────────────────────
-        feature_df = build_features(price_df, news_items, announcements)
+        feature_df = build_features(price_df, news_items, announcements, ticker=symbol)
 
         # ── 7. Train model ────────────────────────────────────────────────────
         model, metadata = train_model(symbol, feature_df)
@@ -208,10 +208,27 @@ def _run_full_pipeline(ticker: str, _unused_db: Session = None) -> None:
                     )
                 )
 
-        # ── 10b. Generate and persist future predictions (next 30 trading days) ──
+        # ── 10b. Generate tomorrow's ensemble price prediction ────────────────
+        tomorrow: dict = {}
+        try:
+            tomorrow = predict_tomorrow(symbol, feature_df)
+            logger.info(
+                "Tomorrow prediction for %s: ₹%.2f (%.2f%%  conf=%.1f%%  model=%s)",
+                symbol,
+                tomorrow.get("predicted_price", 0),
+                tomorrow.get("predicted_return_pct", 0),
+                tomorrow.get("confidence", 0) * 100,
+                tomorrow.get("model", "?"),
+            )
+        except Exception as exc:
+            logger.warning("predict_tomorrow failed for %s: %s", symbol, exc)
+
+        # ── 10c. Generate and persist future predictions (next 30 trading days) ──
         try:
             future_df = generate_future_predictions(symbol, feature_df, days=30)
-            for _, row in future_df.iterrows():
+            for i, (_, row) in enumerate(future_df.iterrows()):
+                # Attach the precise ensemble prediction data to the first future row (tomorrow)
+                is_tomorrow = (i == 0 and tomorrow)
                 db.add(
                     Prediction(
                         ticker=symbol,
@@ -223,6 +240,12 @@ def _run_full_pipeline(ticker: str, _unused_db: Session = None) -> None:
                         lower_band=float(row.get("lower_band", 0)),
                         projected_price=float(row["projected_price"]),
                         prediction_type="future",
+                        # Tomorrow-specific precise fields
+                        predicted_price=      tomorrow.get("predicted_price")      if is_tomorrow else None,
+                        predicted_price_low=  tomorrow.get("predicted_price_low")  if is_tomorrow else None,
+                        predicted_price_high= tomorrow.get("predicted_price_high") if is_tomorrow else None,
+                        predicted_return_pct= tomorrow.get("predicted_return_pct") if is_tomorrow else None,
+                        lstm_up_prob=         tomorrow.get("lstm_up_prob")         if is_tomorrow else None,
                     )
                 )
             logger.info("Stored %d future predictions for %s", len(future_df), symbol)
@@ -521,17 +544,32 @@ def get_chart_data(ticker: str, db: Session = Depends(get_db)) -> dict[str, Any]
     }
 
     # Future predictions series (next 30 days)
+    tomorrow_prediction: dict | None = None
     future_data = []
-    for p in future_preds:
+    for i, p in enumerate(future_preds):
         date_str = p.date.strftime("%Y-%m-%d") if p.date else None
-        future_data.append({
+        row = {
             "date": date_str,
             "projected_price": p.projected_price,
             "predicted_direction": p.predicted_direction,
             "confidence": p.confidence,
             "upper_band": p.upper_band,
             "lower_band": p.lower_band,
-        })
+        }
+        future_data.append(row)
+
+        # First future row = tomorrow — extract precise ensemble prediction
+        if i == 0 and p.predicted_price is not None:
+            tomorrow_prediction = {
+                "date":                date_str,
+                "predicted_price":     p.predicted_price,
+                "predicted_price_low": p.predicted_price_low,
+                "predicted_price_high":p.predicted_price_high,
+                "predicted_return_pct":p.predicted_return_pct,
+                "direction":           p.predicted_direction,
+                "confidence":          p.confidence,
+                "lstm_up_prob":        p.lstm_up_prob,
+            }
 
     # Add initial prediction fields to chart_data
     for entry in chart_data:
@@ -542,9 +580,10 @@ def get_chart_data(ticker: str, db: Session = Depends(get_db)) -> dict[str, Any]
     return {
         "ticker": symbol,
         "display_name": stock.display_name,
-        "chart_data": chart_data,       # historical: actual + updated predictions
-        "future_data": future_data,     # next 30 days: projected prices
+        "chart_data": chart_data,              # historical: actual + updated predictions
+        "future_data": future_data,            # next 30 days: projected prices
         "portfolio_data": portfolio_data,
+        "tomorrow_prediction": tomorrow_prediction,  # precise next-day price estimate
     }
 
 
@@ -654,6 +693,60 @@ async def refresh_stock(
 
     background_tasks.add_task(_run_full_pipeline, symbol)
     return {"message": f"Refresh started for {symbol}. This may take 2-3 minutes."}
+
+
+@app.get("/api/stocks/{ticker}/live")
+def get_live_price(ticker: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """
+    Return the current live market price for a ticker plus intraday stats.
+    Also computes how today's actual movement compares to the model's prediction.
+
+    Designed to be polled every 5–30 seconds from the frontend Live Mode toggle.
+    Yahoo Finance data refreshes ~every 15 seconds during market hours.
+    """
+    from data.live_price_fetcher import fetch_live_price
+
+    symbol = ticker.upper().replace(".NS", "").replace(".BO", "")
+
+    stock = db.query(Stock).filter(Stock.ticker == symbol).first()
+    if not stock:
+        raise HTTPException(status_code=404, detail=f"{symbol} not found")
+
+    live = fetch_live_price(symbol)
+
+    # Pull the model's prediction for today (first future prediction = tomorrow,
+    # which IS today if we're inside trading hours) from the DB
+    tomorrow_pred = (
+        db.query(Prediction)
+        .filter(
+            Prediction.ticker == symbol,
+            Prediction.prediction_type == "future",
+            Prediction.predicted_price.isnot(None),
+        )
+        .order_by(Prediction.date.asc())
+        .first()
+    )
+
+    model_comparison: dict | None = None
+    if tomorrow_pred and live.get("price") and live.get("prev_close"):
+        actual_direction   = 1 if live["price"] > live["prev_close"] else 0
+        predicted_direction = tomorrow_pred.predicted_direction
+        is_correct         = (actual_direction == predicted_direction)
+        model_comparison   = {
+            "predicted_direction":  predicted_direction,        # 1=up 0=down
+            "predicted_price":      tomorrow_pred.predicted_price,
+            "predicted_price_low":  tomorrow_pred.predicted_price_low,
+            "predicted_price_high": tomorrow_pred.predicted_price_high,
+            "predicted_return_pct": tomorrow_pred.predicted_return_pct,
+            "confidence":           tomorrow_pred.confidence,
+            "actual_direction_now": actual_direction,
+            "prediction_correct":   is_correct,
+            "gap_to_target":        round(
+                (tomorrow_pred.predicted_price or 0) - (live["price"] or 0), 2
+            ),
+        }
+
+    return {**live, "model_comparison": model_comparison}
 
 
 @app.get("/api/health")

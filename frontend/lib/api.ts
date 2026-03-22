@@ -40,6 +40,17 @@ export interface FutureDataPoint {
   lower_band: number;
 }
 
+export interface TomorrowPrediction {
+  date: string;
+  predicted_price: number;
+  predicted_price_low: number;
+  predicted_price_high: number;
+  predicted_return_pct: number;
+  direction: number;          // 1 = up, 0 = down
+  confidence: number;
+  lstm_up_prob: number | null;
+}
+
 export interface PortfolioDataPoint {
   date: string;
   portfolio_value: number;
@@ -52,6 +63,7 @@ export interface ChartResponse {
   chart_data: ChartDataPoint[];
   future_data: FutureDataPoint[];
   portfolio_data: PortfolioDataPoint[];
+  tomorrow_prediction: TomorrowPrediction | null;
 }
 
 export interface StockStats {
@@ -94,6 +106,36 @@ export interface PortfolioHolding {
   signal_confidence: number | null;
 }
 
+export interface LiveModelComparison {
+  predicted_direction: number;
+  predicted_price: number;
+  predicted_price_low: number;
+  predicted_price_high: number;
+  predicted_return_pct: number;
+  confidence: number;
+  actual_direction_now: number;
+  prediction_correct: boolean;
+  gap_to_target: number;
+}
+
+export interface LiveData {
+  ticker: string;
+  price: number | null;
+  prev_close: number | null;
+  open: number | null;
+  day_high: number | null;
+  day_low: number | null;
+  change: number | null;
+  change_pct: number | null;
+  change_from_open: number | null;
+  volume: number | null;
+  market_status: "open" | "pre_open" | "pre_pre_open" | "post_close" | "closed" | "closed_weekend";
+  is_trading: boolean;
+  timestamp: string;
+  error: string | null;
+  model_comparison: LiveModelComparison | null;
+}
+
 // ── API Functions ─────────────────────────────────────────────────────────────
 
 export async function fetchStocks(): Promise<StockSummary[]> {
@@ -129,6 +171,11 @@ export async function fetchNews(ticker: string, limit = 50): Promise<NewsRespons
 
 export async function refreshStock(ticker: string): Promise<{ message: string }> {
   const res = await api.post(`/api/stocks/${ticker}/refresh`);
+  return res.data;
+}
+
+export async function fetchLivePrice(ticker: string): Promise<LiveData> {
+  const res = await api.get<LiveData>(`/api/stocks/${ticker}/live`);
   return res.data;
 }
 

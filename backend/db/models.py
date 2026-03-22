@@ -48,6 +48,13 @@ class Prediction(Base):
     # For future predictions: the projected price (actual_price will be null)
     projected_price = Column(Float, nullable=True)
 
+    # Tomorrow's ensemble price prediction (set on the nearest future prediction only)
+    predicted_price      = Column(Float, nullable=True)   # point estimate (₹)
+    predicted_price_low  = Column(Float, nullable=True)   # lower band (₹)
+    predicted_price_high = Column(Float, nullable=True)   # upper band (₹)
+    predicted_return_pct = Column(Float, nullable=True)   # expected % move
+    lstm_up_prob         = Column(Float, nullable=True)   # LSTM P(up) for transparency
+
     __table_args__ = (
         UniqueConstraint("ticker", "date", "prediction_type", name="uq_prediction_ticker_date_type"),
     )
